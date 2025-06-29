@@ -5,138 +5,86 @@ library(stringr)
 library(openai)
 library(purrr)
 library(tibble)
+library(tidyr)
 
-# 0b) OpenAI key check and re-connect to WRDS
+#–– 0) READ THE FULL “TEXT + RATIOS” DATASET -------------------------------
+final_df <- read_csv("final_dataset_with_text_embeddings_and_assets.csv")
+
+#–– 1) FILTER TO FIRMS WITH VALID POLICY TEXT ------------------------------
+policies <- final_df %>%
+  filter(!is.na(text_block) & str_length(text_block) >= 10)
+
+#–– 2) OPENAI KEY CHECK ----------------------------------------------------
 if (!nzchar(Sys.getenv("OPENAI_API_KEY"))) {
-  stop("Please set OPENAI_API_KEY in your environment (e.g. in ~/.Renviron) and restart R.")
+  stop("Please set OPENAI_API_KEY in your environment and restart R.")
 }
 
-# Re‐connect to pull SIC codes
-con2 <- dbConnect(
-  Postgres(),
-  host    = "wrds-pgdata.wharton.upenn.edu",
-  port    = 9737,
-  dbname  = "wrds",
-  user    = Sys.getenv("WRDS_USER"),
-  password= Sys.getenv("WRDS_PASS"),
-  sslmode = "require"
-)
-
-comp_sic2 <- tbl(con2, Id("comp","company")) %>%
-  select(cik, sic) %>%
-  collect() %>%
-  mutate(
-    # drop leading zeros and re‐pad to ten digits for consistency
-    cik  = str_pad(as.character(as.integer(cik)), width = 10, pad = "0"),
-    sic2 = floor(as.numeric(sic)/100)
-  ) %>%
-  select(cik, sic2)
-
-dbDisconnect(con2)
-
-#–– 8) EMBEDDINGS -----------------------------------------------------------
-# only keep those with text
-policies <- final_df %>%
-  filter(!is.na(text_block) & str_length(text_block)>=10)
-
-# safe truncation (≈14k chars)
+#–– 3) GENERATE RAW EMBEDDINGS ---------------------------------------------
+# Truncate long text to ~14k chars to fit within embedding limits
 TRUNCATE_CHARS <- 14000L
-truncate_to_safe <- function(txt) if (nchar(txt)>TRUNCATE_CHARS) substr(txt,1,TRUNCATE_CHARS) else txt
+truncate_to_safe <- function(txt) {
+  if (nchar(txt) > TRUNCATE_CHARS) substr(txt, 1, TRUNCATE_CHARS) else txt
+}
 
-# prepare embedding column
+# Initialize embedding column
 policies$policy_embedding <- NA_character_
 
-# helper
-get_one_embedding <- function(txt, idx=NA_integer_) {
+# Helper to call OpenAI and collapse into comma‐string
+get_one_embedding <- function(txt) {
   txt2 <- truncate_to_safe(txt)
-  resp <- tryCatch(
-    create_embedding(model="text-embedding-ada-002", input=txt2),
-    error = function(e) e
+  res  <- tryCatch(
+    create_embedding(model = "text-embedding-ada-002", input = txt2),
+    error = function(e) NULL
   )
-  if (inherits(resp,"error")) return(NA_character_)
-  emb <- resp$data$embedding[[1]]
-  if (!is.numeric(emb)) return(NA_character_)
-  paste(emb, collapse=",")
+  if (is.null(res)) return(NA_character_)
+  emb <- res$data$embedding[[1]]
+  paste(emb, collapse = ",")
 }
 
-# loop
+# Loop with progress messages
 for (i in seq_len(nrow(policies))) {
-  if (i%%100==1) message("Embedding ",i,"/",nrow(policies))
-  policies$policy_embedding[i] <- get_one_embedding(policies$text_block[i], i)
+  if (i %% 100 == 1) message("Embedding ", i, "/", nrow(policies))
+  policies$policy_embedding[i] <- get_one_embedding(policies$text_block[i])
 }
 
-# save
-write_csv(policies, "all_firms_with_policy_embeddings.csv", na="")
-message("All done: embeddings in all_firms_with_policy_embeddings.csv")
+# Save the raw embeddings alongside *all* other columns
+write_csv(policies,
+          "policies_with_embeddings.csv",
+          na = "")
 
+#–– 4) PARSE & TRUNCATE EMBEDDINGS INTO 64 DIMENSIONS ----------------------
+# Re‐load to be safe
+df_raw <- read_csv("policies_with_embeddings.csv", show_col_types = FALSE)
 
-# 8b) Build restatement assets table
-rst_assets <- clean_rst %>%
-  select(cik, year, at) %>%
-  distinct()
+# Compute expected embedding length
+expected_dim <- str_count(df_raw$policy_embedding[1], ",") + 1
 
-# 8c) Build control assets table
-ctrl_assets <- funda_sub %>%
-  inner_join(comp_map %>% select(gvkey, cik), by = "gvkey") %>%
-  select(cik, year, at) %>%
-  distinct()
-
-# 8d) Assemble final_df
-final_df <- df_input %>%
-  left_join(rst_assets,  by = c("cik","year")) %>%
-  left_join(ctrl_assets, by = c("cik","year"), suffix = c(".rst",".ctrl")) %>%
-  mutate(at = coalesce(at.rst, at.ctrl)) %>%
-  select(cik, year, is_rst, at) %>%
-  left_join(
-    policies %>% select(cik, year, text_block, policy_embedding),
-    by = c("cik","year")
-  ) %>%
-  # Pull in sic2
-  left_join(comp_sic2, by = "cik") %>%
-  # drop any rows with missing policy text or at
-  filter(!is.na(text_block))
-
-final_df <- final_df %>%
-  filter(!is.na(at))
-  
-# 8e) Save it
-write_csv(final_df, "final_dataset_with_text_embeddings_and_assets.csv")
-message("✅ final_df is ready!")
-
-
-
-#–– 2) DEFINE EXPECTED EMBEDDING DIMENSION --------------------------------
-# e.g. embedding-ada-002 returns 1536‐length vectors
-expected_dim <- str_count(final_df$policy_embedding[1], ",") + 1
-
-#–– 3) FILTER TO ONLY VALID EMBEDDINGS ------------------------------------
-df_emb <- final_df %>%
-  # drop NA and those that don’t split to exactly expected_dim numbers
+df_filtered <- df_raw %>%
   filter(
     !is.na(policy_embedding),
     str_count(policy_embedding, ",") + 1 == expected_dim
   )
 
-#–– 4) PARSE EMBEDDINGS INTO A NUMERIC MATRIX -----------------------------
-emb_list <- str_split(df_emb$policy_embedding, pattern = ",")
+# Split into numeric and form matrix
+emb_list <- str_split(df_filtered$policy_embedding, ",")
 emb_mat  <- matrix(
   as.numeric(unlist(emb_list)),
   ncol   = expected_dim,
   byrow  = TRUE
 )
 
-#–– 5) TAKE FIRST 64 EMBEDDING DIMENSIONS ----------------------------------
+# Keep only first 64 dims
 emb64 <- emb_mat[, 1:64, drop = FALSE]
 colnames(emb64) <- paste0("Emb", seq_len(ncol(emb64)))
 
-#–– 6) BIND BACK TO df_emb -----------------------------------------------
-df_final_emb64 <- bind_cols(
-  df_emb,
+#–– 5) BIND BACK & DROP ANY INCOMPLETE ROWS -------------------------------
+df_final <- bind_cols(
+  df_filtered %>% select(-policy_embedding),
   as_tibble(emb64)
-)
+) %>%
+  drop_na()  # this will remove any rows missing text, at, ratios or embeddings
 
-final_df <- df_final_emb64
-
-final_df$sic2 <- as.factor(final_df$sic2)
-
-
+#–– 6) SAVE THE COMPLETE MODEL-READY DATASET ------------------------------
+write_csv(df_final,
+          "final_dataset_with_64embeddings.csv",
+          na = "")
